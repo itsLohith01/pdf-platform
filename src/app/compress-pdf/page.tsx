@@ -4,7 +4,6 @@ import { useEffect, useState } from "react";
 import { PDFDocument } from "pdf-lib";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
-
 type PdfInfo = {
     pageCount: number;
     fileSize: number;
@@ -23,11 +22,12 @@ export default function CompressPdfPage() {
         useState<"low" | "recommended" | "high">("recommended");
 
     const [compressing, setCompressing] = useState(false);
+    const [progressStatus, setProgressStatus] = useState<string>("");
     const [compressedFile, setCompressedFile] = useState<Blob | null>(null);
     const [compressedSize, setCompressedSize] = useState<number | null>(null);
 
     /*
-     * PDF.js worker
+     * PDF.js worker setup
      */
     pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
@@ -48,7 +48,7 @@ export default function CompressPdfPage() {
         setCompressedFile(null);
         setCompressedSize(null);
 
-        if (selectedFile.type !== "application/pdf") {
+        if (selectedFile.type !== "application/pdf" && !selectedFile.name.toLowerCase().endsWith(".pdf")) {
             setFile(null);
             setError("Please select a valid PDF file.");
             setLoading(false);
@@ -57,7 +57,7 @@ export default function CompressPdfPage() {
 
         try {
             const bytes = await selectedFile.arrayBuffer();
-            const pdf = await PDFDocument.load(bytes);
+            const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
 
             setFile(selectedFile);
 
@@ -72,7 +72,7 @@ export default function CompressPdfPage() {
             setPdfInfo(null);
 
             setError(
-                "Unable to read this PDF. The file may be corrupted or unsupported."
+                "Unable to read this PDF. The file may be corrupted, encrypted, or unsupported."
             );
         } finally {
             setLoading(false);
@@ -101,7 +101,6 @@ export default function CompressPdfPage() {
                 });
 
                 const pdf = await loadingTask.promise;
-
                 const page = await pdf.getPage(1);
 
                 const viewport = page.getViewport({
@@ -115,8 +114,8 @@ export default function CompressPdfPage() {
                     throw new Error("Unable to create canvas context.");
                 }
 
-                canvas.width = viewport.width;
-                canvas.height = viewport.height;
+                canvas.width = Math.ceil(viewport.width);
+                canvas.height = Math.ceil(viewport.height);
 
                 await page.render({
                     canvasContext: context,
@@ -128,13 +127,6 @@ export default function CompressPdfPage() {
                     setThumbnail(canvas.toDataURL("image/png"));
                 }
 
-                /*
-                 * PDF.js cleanup
-                 *
-                 * We intentionally don't call pdf.destroy()
-                 * because the PDF.js version being used may not
-                 * expose destroy() on this object.
-                 */
                 await loadingTask.destroy();
             } catch (err) {
                 console.error("Thumbnail error:", err);
@@ -166,6 +158,7 @@ export default function CompressPdfPage() {
         setError("");
         setCompressedFile(null);
         setCompressedSize(null);
+        setProgressStatus("");
 
         const input = document.getElementById(
             "compress-pdf-upload"
@@ -192,13 +185,7 @@ export default function CompressPdfPage() {
     };
 
     /*
-     * REAL PDF COMPRESSION
-     *
-     * Sends the PDF to:
-     *
-     * /api/compress-pdf
-     *
-     * The API then uses Ghostscript.
+     * Client-Side PDF Compression (100% Serverless & Vercel compatible)
      */
     const handleCompress = async () => {
         if (!file) {
@@ -210,27 +197,95 @@ export default function CompressPdfPage() {
         setCompressing(true);
         setCompressedFile(null);
         setCompressedSize(null);
+        setProgressStatus("Initializing compression...");
 
         try {
-            const formData = new FormData();
+            const bytes = await file.arrayBuffer();
 
-            formData.append("file", file);
-            formData.append("level", compressionLevel);
-
-            const response = await fetch("/api/compress-pdf", {
-                method: "POST",
-                body: formData,
+            const loadingTask = pdfjsLib.getDocument({
+                data: new Uint8Array(bytes),
             });
 
-            if (!response.ok) {
-                const data = await response.json().catch(() => null);
+            const pdf = await loadingTask.promise;
+            const totalPages = pdf.numPages;
 
-                throw new Error(
-                    data?.error || "Failed to compress PDF."
-                );
+            // Settings based on selected compression level
+            const config = {
+                low: { scale: 1.5, quality: 0.82 },
+                recommended: { scale: 1.15, quality: 0.62 },
+                high: { scale: 0.85, quality: 0.42 },
+            }[compressionLevel];
+
+            const compressedDoc = await PDFDocument.create();
+
+            for (let pageNumber = 1; pageNumber <= totalPages; pageNumber++) {
+                setProgressStatus(`Compressing page ${pageNumber} of ${totalPages}...`);
+
+                const page = await pdf.getPage(pageNumber);
+                const originalViewport = page.getViewport({ scale: 1.0 });
+                const renderViewport = page.getViewport({ scale: config.scale });
+
+                const canvas = document.createElement("canvas");
+                canvas.width = Math.ceil(renderViewport.width);
+                canvas.height = Math.ceil(renderViewport.height);
+
+                const context = canvas.getContext("2d");
+                if (!context) {
+                    throw new Error("Unable to create canvas context.");
+                }
+
+                // Fill white background before rendering
+                context.fillStyle = "#ffffff";
+                context.fillRect(0, 0, canvas.width, canvas.height);
+
+                await page.render({
+                    canvasContext: context,
+                    viewport: renderViewport,
+                    canvas,
+                }).promise;
+
+                // Convert rendered page to JPEG at specified compression quality
+                const jpegDataUrl = canvas.toDataURL("image/jpeg", config.quality);
+                const base64Data = jpegDataUrl.split(",")[1];
+                const binaryString = atob(base64Data);
+                const imgBytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    imgBytes[i] = binaryString.charCodeAt(i);
+                }
+
+                // Embed JPEG image into new PDF document
+                const embeddedImage = await compressedDoc.embedJpg(imgBytes);
+
+                // Add page preserving exact original dimensions
+                const newPage = compressedDoc.addPage([
+                    originalViewport.width,
+                    originalViewport.height,
+                ]);
+
+                newPage.drawImage(embeddedImage, {
+                    x: 0,
+                    y: 0,
+                    width: originalViewport.width,
+                    height: originalViewport.height,
+                });
+
+                // Clean up canvas memory
+                canvas.width = 1;
+                canvas.height = 1;
+                page.cleanup();
             }
 
-            const compressedBlob = await response.blob();
+            setProgressStatus("Saving compressed PDF...");
+            const compressedBytes = await compressedDoc.save({
+                useObjectStreams: true,
+                addDefaultPage: false,
+            });
+
+            await loadingTask.destroy();
+
+            const compressedBlob = new Blob([compressedBytes as unknown as BlobPart], {
+                type: "application/pdf",
+            });
 
             setCompressedFile(compressedBlob);
             setCompressedSize(compressedBlob.size);
@@ -240,10 +295,11 @@ export default function CompressPdfPage() {
             setError(
                 err instanceof Error
                     ? err.message
-                    : "Unable to compress this PDF."
+                    : "Unable to compress this PDF. Please try another file."
             );
         } finally {
             setCompressing(false);
+            setProgressStatus("");
         }
     };
 
@@ -260,9 +316,6 @@ export default function CompressPdfPage() {
             )
             : 0;
 
-    /*
-     * Render page
-     */
     return (
         <main className="min-h-screen bg-gray-50 px-6 py-12">
             <div className="mx-auto max-w-5xl">
@@ -274,8 +327,7 @@ export default function CompressPdfPage() {
                     </h1>
 
                     <p className="mt-3 text-lg text-gray-600">
-                        Reduce your PDF file size while keeping the document
-                        usable.
+                        Reduce your PDF file size while keeping the document clear and usable.
                     </p>
                 </div>
 
@@ -291,13 +343,13 @@ export default function CompressPdfPage() {
 
                     <label
                         htmlFor="compress-pdf-upload"
-                        className="inline-block cursor-pointer rounded-lg bg-black px-6 py-3 font-medium text-white transition hover:bg-gray-800"
+                        className="inline-block cursor-pointer rounded-lg bg-[#5b5bd6] px-6 py-3 font-medium text-white transition hover:bg-[#4f46c7]"
                     >
                         Choose PDF
                     </label>
 
                     <p className="mt-4 text-sm text-gray-500">
-                        Select one PDF file
+                        Select one PDF file from your device
                     </p>
                 </div>
 
@@ -405,8 +457,7 @@ export default function CompressPdfPage() {
                             </h3>
 
                             <p className="mt-2 text-sm text-gray-500">
-                                Choose how strongly the PDF should be
-                                compressed.
+                                Choose how strongly the PDF should be compressed.
                             </p>
 
                             <div className="mt-5 grid gap-4 sm:grid-cols-3">
@@ -419,16 +470,16 @@ export default function CompressPdfPage() {
                                     }
                                     disabled={compressing}
                                     className={`rounded-xl border p-5 text-left transition ${compressionLevel === "low"
-                                        ? "border-indigo-600 bg-indigo-50 ring-2 ring-indigo-200"
+                                        ? "border-[#5b5bd6] bg-indigo-50 ring-2 ring-indigo-200"
                                         : "border-gray-200 bg-white hover:border-gray-400"
                                         }`}
                                 >
                                     <p className="font-semibold text-gray-900">
-                                        Low
+                                        Low Compression
                                     </p>
 
                                     <p className="mt-1 text-sm text-gray-500">
-                                        Better quality, smaller reduction.
+                                        High image quality, moderate file reduction.
                                     </p>
                                 </button>
 
@@ -440,7 +491,7 @@ export default function CompressPdfPage() {
                                     }
                                     disabled={compressing}
                                     className={`rounded-xl border p-5 text-left transition ${compressionLevel === "recommended"
-                                        ? "border-indigo-600 bg-indigo-50 ring-2 ring-indigo-200"
+                                        ? "border-[#5b5bd6] bg-indigo-50 ring-2 ring-indigo-200"
                                         : "border-gray-200 bg-white hover:border-gray-400"
                                         }`}
                                 >
@@ -449,7 +500,7 @@ export default function CompressPdfPage() {
                                     </p>
 
                                     <p className="mt-1 text-sm text-gray-500">
-                                        Balanced quality and file size.
+                                        Balanced quality and optimal file size.
                                     </p>
                                 </button>
 
@@ -461,16 +512,16 @@ export default function CompressPdfPage() {
                                     }
                                     disabled={compressing}
                                     className={`rounded-xl border p-5 text-left transition ${compressionLevel === "high"
-                                        ? "border-indigo-600 bg-indigo-50 ring-2 ring-indigo-200"
+                                        ? "border-[#5b5bd6] bg-indigo-50 ring-2 ring-indigo-200"
                                         : "border-gray-200 bg-white hover:border-gray-400"
                                         }`}
                                 >
                                     <p className="font-semibold text-gray-900">
-                                        High
+                                        High Compression
                                     </p>
 
                                     <p className="mt-1 text-sm text-gray-500">
-                                        Maximum reduction, lower quality.
+                                        Maximum file size reduction.
                                     </p>
                                 </button>
 
@@ -482,10 +533,10 @@ export default function CompressPdfPage() {
                             type="button"
                             onClick={handleCompress}
                             disabled={compressing}
-                            className="mt-8 w-full rounded-xl bg-indigo-600 px-6 py-4 font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60"
+                            className="mt-8 w-full rounded-xl bg-[#5b5bd6] px-6 py-4 font-semibold text-white transition hover:bg-[#4f46c7] disabled:cursor-not-allowed disabled:opacity-60"
                         >
                             {compressing
-                                ? "Compressing PDF..."
+                                ? progressStatus || "Compressing PDF..."
                                 : "Compress PDF"}
                         </button>
 
@@ -521,11 +572,11 @@ export default function CompressPdfPage() {
 
                                     <div>
                                         <p className="text-sm text-gray-500">
-                                            Saved
+                                            Reduction
                                         </p>
 
                                         <p className="mt-1 font-semibold text-green-700">
-                                            {compressionPercentage}%
+                                            {compressionPercentage > 0 ? `${compressionPercentage}% Saved` : "Optimized"}
                                         </p>
                                     </div>
 

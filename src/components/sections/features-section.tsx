@@ -28,9 +28,9 @@ const features = [
     },
     {
         icon: ShieldCheck,
-        title: "Secure Processing",
+        title: "Secure & Client-Side",
         description:
-            "Your documents are handled securely while you work with them.",
+            "Your files never leave your device for client-side operations. 100% private and secure.",
     },
     {
         icon: Settings2,
@@ -40,15 +40,15 @@ const features = [
     },
     {
         icon: Download,
-        title: "Easy Downloads",
+        title: "Instant Downloads",
         description:
-            "Download your processed documents whenever your task is complete.",
+            "Download your processed documents immediately whenever your task is complete.",
     },
 ];
 
 export default function FeatureSection() {
     return (
-        <section className="px-6 py-24">
+        <section id="features" className="px-6 py-24 bg-white">
             <div className="mx-auto max-w-7xl">
                 <div className="mx-auto mb-12 max-w-2xl text-center">
                     <p className="mb-3 text-sm font-semibold uppercase tracking-wider text-gray-500">
@@ -72,9 +72,9 @@ export default function FeatureSection() {
                         return (
                             <div
                                 key={feature.title}
-                                className="group rounded-2xl border border-gray-200 bg-white p-6 transition-all duration-200 hover:-translate-y-1 hover:border-gray-300 hover:shadow-lg"
+                                className="group rounded-2xl border border-gray-200 bg-gray-50/50 p-6 transition-all duration-200 hover:-translate-y-1 hover:border-gray-300 hover:bg-white hover:shadow-lg"
                             >
-                                <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-xl bg-gray-100 transition-colors duration-200 group-hover:bg-black group-hover:text-white">
+                                <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-xl bg-gray-100 transition-colors duration-200 group-hover:bg-[#5b5bd6] group-hover:text-white">
                                     <Icon className="h-6 w-6" />
                                 </div>
 

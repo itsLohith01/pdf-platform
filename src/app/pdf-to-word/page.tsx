@@ -25,7 +25,7 @@ function isTextItem(item: unknown): item is ExtractedTextItem {
     );
 }
 
-// Clean non-printable characters that are invalid in Word XML
+// Clean non-printable characters that cause Word XML errors
 function sanitizeXmlText(text: string): string {
     return text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]/g, "");
 }
@@ -34,6 +34,8 @@ export default function PdfToWordPage() {
     const [file, setFile] = useState<File | null>(null);
     const [pdfInfo, setPdfInfo] = useState<PdfInfo | null>(null);
     const [thumbnail, setThumbnail] = useState<string | null>(null);
+
+    const [conversionMode, setConversionMode] = useState<"editable" | "visual">("editable");
 
     const [loading, setLoading] = useState(false);
     const [thumbnailLoading, setThumbnailLoading] = useState(false);
@@ -50,7 +52,7 @@ export default function PdfToWordPage() {
     pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
     /*
-     * Handle PDF upload with robust PDF.js reader
+     * Handle PDF upload
      */
     const handleFileChange = async (
         event: React.ChangeEvent<HTMLInputElement>
@@ -211,7 +213,7 @@ export default function PdfToWordPage() {
     };
 
     /*
-     * Convert PDF to Word (.docx) directly in browser
+     * Robust PDF to Word Converter
      */
     const handleConvert = async () => {
         if (!file) {
@@ -236,100 +238,39 @@ export default function PdfToWordPage() {
             const docParagraphs: Paragraph[] = [];
 
             for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-                setProgressStatus(`Processing page ${pageNum} of ${totalPages}...`);
+                setProgressStatus(`Converting page ${pageNum} of ${totalPages}...`);
 
                 const page = await pdf.getPage(pageNum);
-                const textContent = await page.getTextContent();
+                const viewport = page.getViewport({ scale: 1.0 });
 
-                const textItems: ExtractedTextItem[] = (
-                    textContent.items as unknown[]
-                ).filter(isTextItem);
-
-                const hasExtractableText = textItems.some(
-                    (item) => item.str.trim().length > 0
-                );
-
-                if (hasExtractableText) {
-                    // Sort items top-to-bottom, left-to-right (in PDF coords, higher Y is top of page)
-                    textItems.sort((a, b) => {
-                        const yDiff = Math.abs(a.transform[5] - b.transform[5]);
-                        if (yDiff < 4) {
-                            return a.transform[4] - b.transform[4];
-                        }
-                        return b.transform[5] - a.transform[5];
-                    });
-
-                    // Group items into coherent lines
-                    const lines: ExtractedTextItem[][] = [];
-                    let currentLine: ExtractedTextItem[] = [];
-                    let lastY: number | null = null;
-
-                    for (const item of textItems) {
-                        const cleanStr = sanitizeXmlText(item.str);
-                        if (!cleanStr) continue;
-
-                        const y = item.transform[5];
-                        if (lastY === null || Math.abs(lastY - y) < 5) {
-                            currentLine.push({ ...item, str: cleanStr });
-                        } else {
-                            if (currentLine.length > 0) lines.push(currentLine);
-                            currentLine = [{ ...item, str: cleanStr }];
-                        }
-                        lastY = y;
-                    }
-                    if (currentLine.length > 0) lines.push(currentLine);
-
-                    // Add structured paragraphs
-                    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-                        const line = lines[lineIndex];
-                        const lineText = line.map((it) => it.str).join(" ").trim();
-                        if (!lineText) continue;
-
-                        const isFirstOnPage = lineIndex === 0 && pageNum > 1;
-
-                        docParagraphs.push(
-                            new Paragraph({
-                                children: [
-                                    new TextRun({
-                                        text: lineText,
-                                        size: 24, // 12pt
-                                        font: "Calibri",
-                                    }),
-                                ],
-                                pageBreakBefore: isFirstOnPage,
-                                spacing: { after: 120, line: 276 },
-                            })
-                        );
-                    }
-                } else {
-                    // Scanned or graphical page: render high-resolution canvas snapshot
-                    const viewport = page.getViewport({ scale: 1.5 });
+                if (conversionMode === "visual") {
+                    // Visual Layout Mode: High-res crisp rendering
+                    const renderViewport = page.getViewport({ scale: 1.8 });
                     const canvas = document.createElement("canvas");
-                    canvas.width = Math.max(1, Math.ceil(viewport.width));
-                    canvas.height = Math.max(1, Math.ceil(viewport.height));
-                    const context = canvas.getContext("2d");
+                    canvas.width = Math.max(1, Math.ceil(renderViewport.width));
+                    canvas.height = Math.max(1, Math.ceil(renderViewport.height));
 
+                    const context = canvas.getContext("2d");
                     if (context) {
                         context.fillStyle = "#ffffff";
                         context.fillRect(0, 0, canvas.width, canvas.height);
 
                         await page.render({
                             canvasContext: context,
-                            viewport,
+                            viewport: renderViewport,
                             canvas,
                         }).promise;
 
                         const imgBlob = await new Promise<Blob | null>((resolve) => {
-                            canvas.toBlob((b) => resolve(b), "image/png");
+                            canvas.toBlob((b) => resolve(b), "image/jpeg", 0.92);
                         });
 
                         if (imgBlob) {
                             const imgBuffer = await imgBlob.arrayBuffer();
                             const imgBytes = new Uint8Array(imgBuffer);
 
-                            const maxWidth = 550;
-                            const ratio = viewport.height / viewport.width;
-                            const targetHeight = Math.round(maxWidth * ratio);
+                            const standardWidth = 540;
+                            const targetHeight = Math.round(standardWidth * (viewport.height / viewport.width));
 
                             docParagraphs.push(
                                 new Paragraph({
@@ -337,10 +278,10 @@ export default function PdfToWordPage() {
                                         new ImageRun({
                                             data: imgBytes,
                                             transformation: {
-                                                width: maxWidth,
+                                                width: standardWidth,
                                                 height: targetHeight,
                                             },
-                                            type: "png",
+                                            type: "jpg",
                                         }),
                                     ],
                                     pageBreakBefore: pageNum > 1,
@@ -351,6 +292,123 @@ export default function PdfToWordPage() {
                         canvas.width = 1;
                         canvas.height = 1;
                     }
+                } else {
+                    // Editable Text Mode with visual fallback for scanned pages
+                    let textItems: ExtractedTextItem[] = [];
+
+                    try {
+                        const textContent = await page.getTextContent();
+                        textItems = (textContent.items as unknown[]).filter(isTextItem);
+                    } catch (tErr) {
+                        console.warn("Text extraction warning on page", pageNum, tErr);
+                    }
+
+                    const hasExtractableText = textItems.some(
+                        (item) => item.str.trim().length > 0
+                    );
+
+                    if (hasExtractableText) {
+                        // Sort items top-to-bottom, left-to-right (higher Y in PDF coords is towards top)
+                        textItems.sort((a, b) => {
+                            const yDiff = Math.abs(a.transform[5] - b.transform[5]);
+                            if (yDiff < 5) {
+                                return a.transform[4] - b.transform[4];
+                            }
+                            return b.transform[5] - a.transform[5];
+                        });
+
+                        // Group into logical lines
+                        const lines: ExtractedTextItem[][] = [];
+                        let currentLine: ExtractedTextItem[] = [];
+                        let lastY: number | null = null;
+
+                        for (const item of textItems) {
+                            const cleanStr = sanitizeXmlText(item.str);
+                            if (!cleanStr) continue;
+
+                            const y = item.transform[5];
+                            if (lastY === null || Math.abs(lastY - y) < 6) {
+                                currentLine.push({ ...item, str: cleanStr });
+                            } else {
+                                if (currentLine.length > 0) lines.push(currentLine);
+                                currentLine = [{ ...item, str: cleanStr }];
+                            }
+                            lastY = y;
+                        }
+                        if (currentLine.length > 0) lines.push(currentLine);
+
+                        // Add editable paragraphs
+                        for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+                            const line = lines[lineIndex];
+                            const lineText = line.map((it) => it.str).join(" ").trim();
+                            if (!lineText) continue;
+
+                            const isFirstOnPage = lineIndex === 0 && pageNum > 1;
+
+                            docParagraphs.push(
+                                new Paragraph({
+                                    children: [
+                                        new TextRun({
+                                            text: lineText,
+                                            size: 24, // 12pt
+                                            font: "Calibri",
+                                        }),
+                                    ],
+                                    pageBreakBefore: isFirstOnPage,
+                                    spacing: { after: 120, line: 276 },
+                                })
+                            );
+                        }
+                    } else {
+                        // Fallback: render page image if no extractable text exists
+                        const renderViewport = page.getViewport({ scale: 1.8 });
+                        const canvas = document.createElement("canvas");
+                        canvas.width = Math.max(1, Math.ceil(renderViewport.width));
+                        canvas.height = Math.max(1, Math.ceil(renderViewport.height));
+                        const context = canvas.getContext("2d");
+
+                        if (context) {
+                            context.fillStyle = "#ffffff";
+                            context.fillRect(0, 0, canvas.width, canvas.height);
+
+                            await page.render({
+                                canvasContext: context,
+                                viewport: renderViewport,
+                                canvas,
+                            }).promise;
+
+                            const imgBlob = await new Promise<Blob | null>((resolve) => {
+                                canvas.toBlob((b) => resolve(b), "image/jpeg", 0.92);
+                            });
+
+                            if (imgBlob) {
+                                const imgBuffer = await imgBlob.arrayBuffer();
+                                const imgBytes = new Uint8Array(imgBuffer);
+
+                                const standardWidth = 540;
+                                const targetHeight = Math.round(standardWidth * (viewport.height / viewport.width));
+
+                                docParagraphs.push(
+                                    new Paragraph({
+                                        children: [
+                                            new ImageRun({
+                                                data: imgBytes,
+                                                transformation: {
+                                                    width: standardWidth,
+                                                    height: targetHeight,
+                                                },
+                                                type: "jpg",
+                                            }),
+                                        ],
+                                        pageBreakBefore: pageNum > 1,
+                                    })
+                                );
+                            }
+
+                            canvas.width = 1;
+                            canvas.height = 1;
+                        }
+                    }
                 }
 
                 page.cleanup();
@@ -359,24 +417,38 @@ export default function PdfToWordPage() {
             if (docParagraphs.length === 0) {
                 docParagraphs.push(
                     new Paragraph({
-                        children: [new TextRun("Empty PDF document.")],
+                        children: [new TextRun("Document content could not be extracted.")],
                     })
                 );
             }
 
-            setProgressStatus("Creating Word document...");
+            setProgressStatus("Building Word (.docx) document...");
 
             const doc = new Document({
                 sections: [
                     {
-                        properties: {},
+                        properties: {
+                            page: {
+                                margin: {
+                                    top: 720,
+                                    right: 720,
+                                    bottom: 720,
+                                    left: 720,
+                                },
+                            },
+                        },
                         children: docParagraphs,
                     },
                 ],
             });
 
-            const docxBlob = await Packer.toBlob(doc);
+            // Use toArrayBuffer for universal runtime stability
+            const arrayBuf = await Packer.toArrayBuffer(doc);
             await loadingTask.destroy();
+
+            const docxBlob = new Blob([arrayBuf], {
+                type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            });
 
             setConvertedFile(docxBlob);
         } catch (err) {
@@ -524,6 +596,59 @@ export default function PdfToWordPage() {
                                         </span>
                                     </div>
                                 </div>
+                            </div>
+                        </div>
+
+                        {/* Mode Selection */}
+                        <div className="mt-8 border-t pt-8">
+                            <h3 className="text-lg font-semibold text-gray-900">
+                                Conversion Mode
+                            </h3>
+
+                            <p className="mt-2 text-sm text-gray-500">
+                                Choose how you want the Word document generated.
+                            </p>
+
+                            <div className="mt-5 grid gap-4 sm:grid-cols-2">
+
+                                {/* Editable Text Mode */}
+                                <button
+                                    type="button"
+                                    onClick={() => setConversionMode("editable")}
+                                    disabled={converting}
+                                    className={`rounded-xl border p-5 text-left transition ${conversionMode === "editable"
+                                        ? "border-[#5b5bd6] bg-indigo-50 ring-2 ring-indigo-200"
+                                        : "border-gray-200 bg-white hover:border-gray-400"
+                                        }`}
+                                >
+                                    <p className="font-semibold text-gray-900">
+                                        Editable Text (Recommended)
+                                    </p>
+
+                                    <p className="mt-1 text-sm text-gray-500">
+                                        Extracts text into editable paragraphs and lines for easy editing in Microsoft Word.
+                                    </p>
+                                </button>
+
+                                {/* Exact Visual Layout */}
+                                <button
+                                    type="button"
+                                    onClick={() => setConversionMode("visual")}
+                                    disabled={converting}
+                                    className={`rounded-xl border p-5 text-left transition ${conversionMode === "visual"
+                                        ? "border-[#5b5bd6] bg-indigo-50 ring-2 ring-indigo-200"
+                                        : "border-gray-200 bg-white hover:border-gray-400"
+                                        }`}
+                                >
+                                    <p className="font-semibold text-gray-900">
+                                        Exact Layout Preservation
+                                    </p>
+
+                                    <p className="mt-1 text-sm text-gray-500">
+                                        Preserves exact visual formatting, diagrams, tables, and typography matching the PDF.
+                                    </p>
+                                </button>
+
                             </div>
                         </div>
 

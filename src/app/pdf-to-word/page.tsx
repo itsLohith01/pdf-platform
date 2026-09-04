@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { PDFDocument } from "pdf-lib";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import { Document, Packer, Paragraph, TextRun, ImageRun } from "docx";
 
@@ -26,6 +25,11 @@ function isTextItem(item: unknown): item is ExtractedTextItem {
     );
 }
 
+// Clean non-printable characters that are invalid in Word XML
+function sanitizeXmlText(text: string): string {
+    return text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]/g, "");
+}
+
 export default function PdfToWordPage() {
     const [file, setFile] = useState<File | null>(null);
     const [pdfInfo, setPdfInfo] = useState<PdfInfo | null>(null);
@@ -46,7 +50,7 @@ export default function PdfToWordPage() {
     pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
     /*
-     * Handle PDF upload
+     * Handle PDF upload with robust PDF.js reader
      */
     const handleFileChange = async (
         event: React.ChangeEvent<HTMLInputElement>
@@ -71,19 +75,25 @@ export default function PdfToWordPage() {
 
         try {
             const bytes = await selectedFile.arrayBuffer();
-            const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+
+            const loadingTask = pdfjsLib.getDocument({
+                data: new Uint8Array(bytes),
+            });
+
+            const pdf = await loadingTask.promise;
 
             setFile(selectedFile);
-
             setPdfInfo({
-                pageCount: pdf.getPageCount(),
+                pageCount: pdf.numPages,
                 fileSize: selectedFile.size,
             });
+
+            await loadingTask.destroy();
         } catch (err) {
-            console.error(err);
+            console.error("PDF upload error:", err);
 
             setError(
-                "Unable to read this PDF. The file may be corrupted, password-protected, or unsupported."
+                "Unable to read this PDF file. It might be corrupted or password-protected."
             );
         } finally {
             setLoading(false);
@@ -125,8 +135,11 @@ export default function PdfToWordPage() {
                     throw new Error("Unable to create canvas context.");
                 }
 
-                canvas.width = Math.ceil(viewport.width);
-                canvas.height = Math.ceil(viewport.height);
+                canvas.width = Math.max(1, Math.ceil(viewport.width));
+                canvas.height = Math.max(1, Math.ceil(viewport.height));
+
+                context.fillStyle = "#ffffff";
+                context.fillRect(0, 0, canvas.width, canvas.height);
 
                 await page.render({
                     canvasContext: context,
@@ -138,6 +151,9 @@ export default function PdfToWordPage() {
                     setThumbnail(canvas.toDataURL("image/png"));
                 }
 
+                canvas.width = 1;
+                canvas.height = 1;
+                page.cleanup();
                 await loadingTask.destroy();
             } catch (err) {
                 console.error("Thumbnail error:", err);
@@ -195,7 +211,7 @@ export default function PdfToWordPage() {
     };
 
     /*
-     * Convert PDF to Word (100% Client-side & Vercel compatible)
+     * Convert PDF to Word (.docx) directly in browser
      */
     const handleConvert = async () => {
         if (!file) {
@@ -234,8 +250,7 @@ export default function PdfToWordPage() {
                 );
 
                 if (hasExtractableText) {
-                    // Sort items top-to-bottom, left-to-right
-                    // In PDF coords, higher Y is towards the top of the page
+                    // Sort items top-to-bottom, left-to-right (in PDF coords, higher Y is top of page)
                     textItems.sort((a, b) => {
                         const yDiff = Math.abs(a.transform[5] - b.transform[5]);
                         if (yDiff < 4) {
@@ -244,25 +259,27 @@ export default function PdfToWordPage() {
                         return b.transform[5] - a.transform[5];
                     });
 
-                    // Group into logical lines
+                    // Group items into coherent lines
                     const lines: ExtractedTextItem[][] = [];
                     let currentLine: ExtractedTextItem[] = [];
                     let lastY: number | null = null;
 
                     for (const item of textItems) {
-                        if (!item.str) continue;
+                        const cleanStr = sanitizeXmlText(item.str);
+                        if (!cleanStr) continue;
+
                         const y = item.transform[5];
                         if (lastY === null || Math.abs(lastY - y) < 5) {
-                            currentLine.push(item);
+                            currentLine.push({ ...item, str: cleanStr });
                         } else {
                             if (currentLine.length > 0) lines.push(currentLine);
-                            currentLine = [item];
+                            currentLine = [{ ...item, str: cleanStr }];
                         }
                         lastY = y;
                     }
                     if (currentLine.length > 0) lines.push(currentLine);
 
-                    // Add paragraphs for this page
+                    // Add structured paragraphs
                     for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
                         const line = lines[lineIndex];
                         const lineText = line.map((it) => it.str).join(" ").trim();
@@ -285,11 +302,11 @@ export default function PdfToWordPage() {
                         );
                     }
                 } else {
-                    // Scanned / Image-based PDF page: render and embed page image
+                    // Scanned or graphical page: render high-resolution canvas snapshot
                     const viewport = page.getViewport({ scale: 1.5 });
                     const canvas = document.createElement("canvas");
-                    canvas.width = Math.ceil(viewport.width);
-                    canvas.height = Math.ceil(viewport.height);
+                    canvas.width = Math.max(1, Math.ceil(viewport.width));
+                    canvas.height = Math.max(1, Math.ceil(viewport.height));
                     const context = canvas.getContext("2d");
 
                     if (context) {
@@ -302,33 +319,34 @@ export default function PdfToWordPage() {
                             canvas,
                         }).promise;
 
-                        const dataUrl = canvas.toDataURL("image/png");
-                        const base64Data = dataUrl.split(",")[1];
-                        const binaryStr = atob(base64Data);
-                        const imgBytes = new Uint8Array(binaryStr.length);
-                        for (let i = 0; i < binaryStr.length; i++) {
-                            imgBytes[i] = binaryStr.charCodeAt(i);
+                        const imgBlob = await new Promise<Blob | null>((resolve) => {
+                            canvas.toBlob((b) => resolve(b), "image/png");
+                        });
+
+                        if (imgBlob) {
+                            const imgBuffer = await imgBlob.arrayBuffer();
+                            const imgBytes = new Uint8Array(imgBuffer);
+
+                            const maxWidth = 550;
+                            const ratio = viewport.height / viewport.width;
+                            const targetHeight = Math.round(maxWidth * ratio);
+
+                            docParagraphs.push(
+                                new Paragraph({
+                                    children: [
+                                        new ImageRun({
+                                            data: imgBytes,
+                                            transformation: {
+                                                width: maxWidth,
+                                                height: targetHeight,
+                                            },
+                                            type: "png",
+                                        }),
+                                    ],
+                                    pageBreakBefore: pageNum > 1,
+                                })
+                            );
                         }
-
-                        const maxWidth = 550;
-                        const ratio = viewport.height / viewport.width;
-                        const targetHeight = Math.round(maxWidth * ratio);
-
-                        docParagraphs.push(
-                            new Paragraph({
-                                children: [
-                                    new ImageRun({
-                                        data: imgBytes,
-                                        transformation: {
-                                            width: maxWidth,
-                                            height: targetHeight,
-                                        },
-                                        type: "png",
-                                    }),
-                                ],
-                                pageBreakBefore: pageNum > 1,
-                            })
-                        );
 
                         canvas.width = 1;
                         canvas.height = 1;
@@ -346,7 +364,7 @@ export default function PdfToWordPage() {
                 );
             }
 
-            setProgressStatus("Generating Word (.docx) document...");
+            setProgressStatus("Creating Word document...");
 
             const doc = new Document({
                 sections: [
@@ -362,12 +380,12 @@ export default function PdfToWordPage() {
 
             setConvertedFile(docxBlob);
         } catch (err) {
-            console.error("Conversion error:", err);
+            console.error("PDF to Word conversion error:", err);
 
             setError(
                 err instanceof Error
                     ? err.message
-                    : "Unable to convert this PDF to Word."
+                    : "Unable to convert this PDF to Word. Please try another file."
             );
         } finally {
             setConverting(false);
@@ -514,7 +532,7 @@ export default function PdfToWordPage() {
                             type="button"
                             onClick={handleConvert}
                             disabled={converting}
-                            className="mt-8 w-full rounded-xl bg-[#5b5bd6] px-6 py-4 font-semibold text-white transition hover:bg-[#4f46c7] disabled:cursor-not-allowed disabled:opacity-60"
+                            className="mt-8 w-full rounded-xl bg-[#5b5bd6] px-6 py-4 font-semibold text-white transition hover:bg-[#4f46c7] disabled:cursor-not-allowed disabled:opacity-60 shadow-sm"
                         >
                             {converting
                                 ? progressStatus || "Converting to Word..."

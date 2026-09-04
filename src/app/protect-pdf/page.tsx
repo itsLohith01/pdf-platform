@@ -101,7 +101,7 @@ export default function ProtectPdfPage() {
                 }
             );
 
-            const blob = new Blob([protectedPdf], {
+            const blob = new Blob([protectedPdf as unknown as BlobPart], {
                 type: "application/pdf",
             });
 
